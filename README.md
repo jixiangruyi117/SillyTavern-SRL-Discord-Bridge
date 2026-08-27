@@ -1,0 +1,69 @@
+# SillyTavern SRL Discord Bridge
+
+A small self-hosted Cloudflare Worker used by SRL to save selected Discord messages into the user's local resource library.
+
+The Bridge is intentionally isolated from the SRL application. Each user deploys their own Worker and D1 database in their own Cloudflare account.
+
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https%3A%2F%2Fgithub.com%2Fjixiangruyi117%2FSillyTavern-SRL-Discord-Bridge)
+
+## What it does
+
+```text
+Discord Message Context Command
+  → your Cloudflare Worker
+  → short-lived one-time D1 handoff
+  → your local SRL
+```
+
+The Worker:
+
+- verifies Discord interaction signatures with Ed25519;
+- accepts only the selected message from the Message Context Command;
+- stores the normalized capture in D1 under a high-entropy one-time token;
+- expires handoffs after a short TTL;
+- allows the handoff to be consumed once by SRL;
+- does not act as a permanent Discord archive.
+
+## Required values
+
+Cloudflare deployment asks for the Discord values belonging to **your own Discord App**:
+
+- `DISCORD_APPLICATION_ID`
+- `DISCORD_PUBLIC_KEY`
+- `DISCORD_BOT_TOKEN` — store this as a secret
+- `SRL_WEB_URL` — optional; useful when opening SRL as a web app / PWA
+
+The D1 binding name is fixed to `DB`.
+
+## Routes
+
+- `POST /interactions` — Discord Interactions Endpoint
+- `GET /health` — connection check used by SRL
+- `POST /setup/register` — registers the `保存到资源库` Message Context Command
+- `GET /handoff/:token` — one-time SRL handoff
+- `GET /open/:token` — opens SRL with the handoff token
+
+Users normally do not need to type these routes. SRL derives them automatically from the Worker root URL.
+
+## Deploy without GitHub / GitLab
+
+SRL also provides a browser-only Cloudflare deployment guide. It generates a Quick Editor version from this same Worker source and adds idempotent D1 schema initialization, so users without a Git account do not need Wrangler or manual SQL.
+
+## Privacy boundary
+
+This repository contains no SRL library data, no Discord credentials and no user content. Credentials are supplied by each user to their own Cloudflare deployment. Discord message payloads are kept only long enough to complete the one-time handoff to the user's local SRL.
+
+## Development
+
+```bash
+npm install
+npm run typecheck
+```
+
+For a normal Wrangler deployment:
+
+```bash
+npm run deploy
+```
+
+The deploy script applies D1 migrations and then deploys the Worker.
