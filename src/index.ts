@@ -329,7 +329,6 @@ async function handleInteraction(
   }
 
   if (interaction.type === 1) {
-    ctx.waitUntil(registerMessageCommand(env).catch((error) => console.error(error)))
     return json({ type: 1 })
   }
 
