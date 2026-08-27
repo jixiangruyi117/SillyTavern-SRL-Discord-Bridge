@@ -1,0 +1,50 @@
+name: tmp-author-bot-sync
+
+on:
+  push:
+    branches:
+      - tmp/author-bot-sync
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: tmp/author-bot-sync
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm install
+      - name: Add Bot/Webhook author metadata
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('src/index.ts')
+          text = path.read_text(encoding='utf-8')
+          anchor = "  if (!authorId || !authorName) throw new Error('无法读取消息作者')\n\n  const channel = interaction.channel"
+          replacement = "  if (!authorId || !authorName) throw new Error('无法读取消息作者')\n  const authorBot = author?.bot === true || Boolean(asString(message.webhook_id))\n\n  const channel = interaction.channel"
+          if anchor not in text:
+              raise SystemExit('author anchor not found')
+          text = text.replace(anchor, replacement, 1)
+          anchor = "    authorId,\n    authorName,\n    content:"
+          replacement = "    authorId,\n    authorName,\n    authorBot,\n    content:"
+          if anchor not in text:
+              raise SystemExit('capture anchor not found')
+          path.write_text(text.replace(anchor, replacement, 1), encoding='utf-8')
+          PY
+      - run: npx prettier --write src/index.ts
+      - run: npm run typecheck
+      - run: npx wrangler deploy --dry-run
+      - name: Commit source and remove temporary workflow
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm .github/workflows/tmp-author-bot-sync.yml
+          git add src/index.ts
+          git commit -m "feat: preserve Discord Bot author metadata"
+          git push origin HEAD:tmp/author-bot-sync
