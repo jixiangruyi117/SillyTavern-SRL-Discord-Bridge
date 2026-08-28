@@ -85,3 +85,7 @@ use `main` as the production branch, `npm run typecheck` as the build command, a
 `npm run deploy` as the deploy command. Keep non-production branch deployments disabled unless
 you explicitly need preview Workers. Discord credentials remain Cloudflare secrets and must never
 be committed to Git.
+
+The production Worker is `srl-discord-source-bridge` at
+`https://srl-discord-source-bridge.z3013461603.workers.dev` and follows this repository's `main`
+branch through Cloudflare Workers Builds.
