@@ -68,7 +68,7 @@ This repository contains no SRL library data, no Discord credentials and no user
 ## Development
 
 ```bash
-npm install
+npm ci
 npm run typecheck
 ```
 
@@ -79,3 +79,9 @@ npm run deploy
 ```
 
 The deploy script applies D1 migrations and then deploys the Worker.
+
+For automatic deployment, connect this repository to the Worker with Cloudflare Workers Builds,
+use `main` as the production branch, `npm run typecheck` as the build command, and
+`npm run deploy` as the deploy command. Keep non-production branch deployments disabled unless
+you explicitly need preview Workers. Discord credentials remain Cloudflare secrets and must never
+be committed to Git.
