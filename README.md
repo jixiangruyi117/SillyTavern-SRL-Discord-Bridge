@@ -1,6 +1,6 @@
 # SillyTavern SRL Discord Bridge
 
-A small self-hosted Cloudflare Worker used by SRL to save selected Discord messages into the user's local resource library.
+A small self-hosted Cloudflare Worker used by SRL to save selected Discord messages into the user's local resource library and, when the user explicitly asks, check a saved Discord source for updates.
 
 The Bridge is intentionally isolated from the SRL application. Each user deploys their own Worker and D1 database in their own Cloudflare account.
 
@@ -13,6 +13,11 @@ Discord Message Context Command
   → your Cloudflare Worker
   → short-lived one-time D1 handoff
   → your local SRL
+
+User taps “检查更新” in SRL
+  → your Cloudflare Worker
+  → bounded read-only Discord API check
+  → comparison / confirmation happens in your local SRL
 ```
 
 The Worker:
@@ -22,7 +27,11 @@ The Worker:
 - stores the normalized capture in D1 under a high-entropy one-time token;
 - expires handoffs after a short TTL;
 - allows the handoff to be consumed once by SRL;
+- performs a bounded, read-only source check only when SRL explicitly requests one;
+- does not persist source-refresh responses in D1;
 - does not act as a permanent Discord archive.
+
+For a thread/forum source, the refresh read is intentionally bounded and only returns messages relevant to SRL's source model: the starter, messages from the starter author, Bot/Webhook messages, and already-saved message IDs. It does not silently archive arbitrary participant comments.
 
 ## Required values
 
@@ -40,6 +49,7 @@ The D1 binding name is fixed to `DB`.
 - `POST /interactions` — Discord Interactions Endpoint
 - `GET /health` — connection check used by SRL
 - `POST /setup/register` — registers the `保存到资源库` Message Context Command
+- `POST /source/read` — authenticated, bounded, read-only source check used by SRL
 - `GET /handoff/:token` — one-time SRL handoff
 - `GET /open/:token` — opens SRL with the handoff token
 
@@ -51,7 +61,7 @@ SRL also provides a browser-only Cloudflare deployment guide. It generates a Qui
 
 ## Privacy boundary
 
-This repository contains no SRL library data, no Discord credentials and no user content. Credentials are supplied by each user to their own Cloudflare deployment. Discord message payloads are kept only long enough to complete the one-time handoff to the user's local SRL.
+This repository contains no SRL library data, no Discord credentials and no user content. Credentials are supplied by each user to their own Cloudflare deployment. Discord Message Context Command payloads are kept only long enough to complete the one-time handoff to the user's local SRL. Source-refresh reads are initiated by the user, returned directly to SRL, and are not stored by the Bridge.
 
 ## Development
 
