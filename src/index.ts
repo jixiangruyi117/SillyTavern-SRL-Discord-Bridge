@@ -21,12 +21,34 @@ interface DiscordInteraction {
   }
 }
 
+type DiscordSourceRemoteScanCursor =
+  | {
+      lastSeenMessageId: string
+      pendingBeforeMessageId?: never
+      pendingHighWaterMessageId?: never
+    }
+  | {
+      lastSeenMessageId: string
+      pendingBeforeMessageId: string
+      pendingHighWaterMessageId: string
+    }
+
 interface DiscordSourceReadRequest {
   guildId?: string
   channelId: string
   threadId?: string
   starterMessageId?: string
   savedMessageIds: string[]
+  scanMessageIds: string[]
+  scanCursor?: DiscordSourceRemoteScanCursor
+}
+
+interface DiscordSavedMessageCheckRequest {
+  guildId?: string
+  channelId: string
+  threadId?: string
+  starterMessageId?: string
+  messageIds: string[]
 }
 
 interface DiscordCaptureContext {
@@ -50,10 +72,22 @@ const THREAD_CHANNEL_TYPES = new Set([10, 11, 12])
 const DISCORD_SNOWFLAKE_PATTERN = /^\d{5,32}$/u
 const MAX_THREAD_PAGES = 3
 const MAX_SAVED_MESSAGE_IDS = 24
+const MAX_HEALTH_MESSAGE_IDS = 12
+const HEALTH_CHECK_CONCURRENCY = 2
 const CORS_HEADERS = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Headers': 'Authorization, Content-Type',
   'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+}
+
+class DiscordRateLimitError extends Error {
+  readonly retryAfterMs?: number
+
+  constructor(operation: string, retryAfterMs?: number) {
+    super(`${operation} rate limited`)
+    this.name = 'DiscordRateLimitError'
+    this.retryAfterMs = retryAfterMs
+  }
 }
 
 function json(value: unknown, init: ResponseInit = {}): Response {
@@ -339,6 +373,32 @@ function validSnowflake(value: string | undefined): value is string {
   return Boolean(value && DISCORD_SNOWFLAKE_PATTERN.test(value))
 }
 
+function compareSnowflakes(left: string, right: string): number {
+  const a = BigInt(left)
+  const b = BigInt(right)
+  return a < b ? -1 : a > b ? 1 : 0
+}
+
+function parseScanCursor(value: unknown): DiscordSourceRemoteScanCursor | undefined {
+  const record = asRecord(value)
+  if (!record) return undefined
+  const lastSeenMessageId = asString(record.lastSeenMessageId).trim() || undefined
+  const pendingBeforeMessageId = asString(record.pendingBeforeMessageId).trim() || undefined
+  const pendingHighWaterMessageId = asString(record.pendingHighWaterMessageId).trim() || undefined
+  if (lastSeenMessageId && !validSnowflake(lastSeenMessageId)) return undefined
+  if (pendingBeforeMessageId && !validSnowflake(pendingBeforeMessageId)) return undefined
+  if (pendingHighWaterMessageId && !validSnowflake(pendingHighWaterMessageId)) return undefined
+  if (pendingBeforeMessageId || pendingHighWaterMessageId) {
+    if (!lastSeenMessageId || !pendingBeforeMessageId || !pendingHighWaterMessageId)
+      return undefined
+  }
+  if (!lastSeenMessageId && !pendingBeforeMessageId && !pendingHighWaterMessageId) return undefined
+  if (lastSeenMessageId && pendingBeforeMessageId && pendingHighWaterMessageId) {
+    return { lastSeenMessageId, pendingBeforeMessageId, pendingHighWaterMessageId }
+  }
+  return lastSeenMessageId ? { lastSeenMessageId } : undefined
+}
+
 function parseSourceReadRequest(value: unknown): DiscordSourceReadRequest | undefined {
   const record = asRecord(value)
   if (!record) return undefined
@@ -360,7 +420,53 @@ function parseSourceReadRequest(value: unknown): DiscordSourceReadRequest | unde
         ),
       ).slice(0, MAX_SAVED_MESSAGE_IDS)
     : []
-  return { guildId, channelId, threadId, starterMessageId, savedMessageIds }
+  const scanMessageIds = Array.isArray(record.scanMessageIds)
+    ? Array.from(
+        new Set(
+          record.scanMessageIds
+            .filter((item): item is string => typeof item === 'string')
+            .map((item) => item.trim())
+            .filter((item) => DISCORD_SNOWFLAKE_PATTERN.test(item)),
+        ),
+      ).slice(0, MAX_HEALTH_MESSAGE_IDS)
+    : []
+  const scanCursor = parseScanCursor(record.scanCursor)
+  return {
+    guildId,
+    channelId,
+    threadId,
+    starterMessageId,
+    savedMessageIds,
+    scanMessageIds,
+    scanCursor,
+  }
+}
+
+function parseSavedMessageCheckRequest(
+  value: unknown,
+): DiscordSavedMessageCheckRequest | undefined {
+  const record = asRecord(value)
+  if (!record) return undefined
+  const channelId = asString(record.channelId).trim()
+  const guildId = asString(record.guildId).trim() || undefined
+  const threadId = asString(record.threadId).trim() || undefined
+  const starterMessageId = asString(record.starterMessageId).trim() || undefined
+  if (!validSnowflake(channelId)) return undefined
+  if (guildId && !validSnowflake(guildId)) return undefined
+  if (threadId && !validSnowflake(threadId)) return undefined
+  if (starterMessageId && !validSnowflake(starterMessageId)) return undefined
+  const messageIds = Array.isArray(record.messageIds)
+    ? Array.from(
+        new Set(
+          record.messageIds
+            .filter((item): item is string => typeof item === 'string')
+            .map((item) => item.trim())
+            .filter((item) => DISCORD_SNOWFLAKE_PATTERN.test(item)),
+        ),
+      ).slice(0, MAX_HEALTH_MESSAGE_IDS)
+    : []
+  if (!messageIds.length) return undefined
+  return { guildId, channelId, threadId, starterMessageId, messageIds }
 }
 
 async function discordApi(env: Env, path: string): Promise<Response> {
@@ -374,7 +480,17 @@ function sourceUnavailable(response: Response): boolean {
   return response.status === 403 || response.status === 404
 }
 
+function retryAfterMs(response: Response): number | undefined {
+  const header =
+    response.headers.get('Retry-After') ?? response.headers.get('X-RateLimit-Reset-After')
+  if (!header) return undefined
+  const value = Number(header)
+  if (!Number.isFinite(value) || value < 0) return undefined
+  return Math.round(value * 1_000)
+}
+
 async function discordJson(response: Response, operation: string): Promise<unknown> {
+  if (response.status === 429) throw new DiscordRateLimitError(operation, retryAfterMs(response))
   if (!response.ok) {
     const detail = (await response.text()).slice(0, 500)
     throw new Error(`${operation} failed: ${response.status} ${detail}`)
@@ -459,11 +575,41 @@ function recordsFromMessageList(payload: unknown): Record<string, unknown>[] {
   })
 }
 
+function buildInitialThreadQuery(scanCursor: DiscordSourceRemoteScanCursor | undefined): string {
+  const query = new URLSearchParams({ limit: '100' })
+  if (scanCursor?.pendingBeforeMessageId) {
+    query.set('before', scanCursor.pendingBeforeMessageId)
+  } else if (scanCursor?.lastSeenMessageId) {
+    query.set('after', scanCursor.lastSeenMessageId)
+  }
+  return query.toString()
+}
+
+function nextScanCursor(
+  inputCursor: DiscordSourceRemoteScanCursor | undefined,
+  highWaterMessageId: string | undefined,
+  nextBeforeMessageId: string | undefined,
+): DiscordSourceRemoteScanCursor | undefined {
+  if (!highWaterMessageId) return inputCursor
+  if (nextBeforeMessageId && inputCursor?.lastSeenMessageId) {
+    return {
+      lastSeenMessageId: inputCursor.lastSeenMessageId,
+      pendingBeforeMessageId: nextBeforeMessageId,
+      pendingHighWaterMessageId: inputCursor.pendingHighWaterMessageId ?? highWaterMessageId,
+    }
+  }
+  return { lastSeenMessageId: inputCursor?.pendingHighWaterMessageId ?? highWaterMessageId }
+}
+
 async function readSourceMessages(
   env: Env,
   input: DiscordSourceReadRequest,
 ): Promise<
-  | { state: 'available'; captures: Array<Record<string, unknown>> }
+  | {
+      state: 'available'
+      captures: Array<Record<string, unknown>>
+      scanCursor?: DiscordSourceRemoteScanCursor
+    }
   | { state: 'unavailable'; reason: 'not_found' | 'forbidden' }
 > {
   const channelId = input.threadId ?? input.channelId
@@ -496,7 +642,10 @@ async function readSourceMessages(
         forumTags: [],
       })
   const firstPagePromise = threadId
-    ? discordApi(env, `/channels/${encodeURIComponent(channelId)}/messages?limit=100`)
+    ? discordApi(
+        env,
+        `/channels/${encodeURIComponent(channelId)}/messages?${buildInitialThreadQuery(input.scanCursor)}`,
+      )
     : Promise.resolve<Response | undefined>(undefined)
 
   const [starterResponse, guildName, parentMetadata, firstPageResponse] = await Promise.all([
@@ -528,6 +677,7 @@ async function readSourceMessages(
   const messages = new Map<string, Record<string, unknown>>()
   messages.set(starterMessageId, starter)
   const starterAuthorId = asString(asRecord(starter.author)?.id)
+  let scanCursor = input.scanCursor
 
   if (threadId && firstPageResponse) {
     if (sourceUnavailable(firstPageResponse)) {
@@ -539,23 +689,49 @@ async function readSourceMessages(
     let records = recordsFromMessageList(
       await discordJson(firstPageResponse, 'Discord thread messages read'),
     )
+    const lowerBound = input.scanCursor?.lastSeenMessageId
+    let highWaterMessageId = input.scanCursor?.pendingHighWaterMessageId
+    let nextBeforeMessageId: string | undefined
+    let completed = false
+
     for (let page = 0; page < MAX_THREAD_PAGES; page += 1) {
+      if (!highWaterMessageId) {
+        const newest = asString(records[0]?.id)
+        if (validSnowflake(newest)) highWaterMessageId = newest
+      }
+      let crossedLowerBound = false
       for (const message of records) {
         const id = asString(message.id)
         if (!validSnowflake(id)) continue
+        if (lowerBound && compareSnowflakes(id, lowerBound) <= 0) {
+          crossedLowerBound = true
+          continue
+        }
         const author = asRecord(message.author)
         const authorId = asString(author?.id)
         const relevant =
           input.savedMessageIds.includes(id) ||
+          input.scanMessageIds.includes(id) ||
           id === starterMessageId ||
           (starterAuthorId && authorId === starterAuthorId) ||
           author?.bot === true ||
           Boolean(asString(message.webhook_id))
         if (relevant) messages.set(id, message)
       }
-      if (records.length < 100 || page + 1 >= MAX_THREAD_PAGES) break
+
+      if (crossedLowerBound || records.length < 100) {
+        completed = true
+        break
+      }
       const before = asString(records.at(-1)?.id)
-      if (!validSnowflake(before)) break
+      if (!validSnowflake(before)) {
+        completed = true
+        break
+      }
+      if (page + 1 >= MAX_THREAD_PAGES) {
+        nextBeforeMessageId = before
+        break
+      }
       const query = new URLSearchParams({ limit: '100', before })
       const response = await discordApi(
         env,
@@ -569,6 +745,20 @@ async function readSourceMessages(
       }
       records = recordsFromMessageList(await discordJson(response, 'Discord thread messages read'))
     }
+
+    if (!lowerBound) {
+      // 旧来源 / 首次读取保持原来的“最多最近 300 条”合同；完成这次有界 bootstrap 后
+      // 只把最顶部 message 作为后续增量高水位，不尝试无限回扫历史。
+      // 空 thread 极端情况下以 starter 作为稳定下界，避免下次又退回 bootstrap。
+      const bootstrapHighWater = highWaterMessageId ?? starterMessageId
+      scanCursor = { lastSeenMessageId: bootstrapHighWater }
+    } else {
+      scanCursor = nextScanCursor(
+        input.scanCursor,
+        highWaterMessageId,
+        completed ? undefined : nextBeforeMessageId,
+      )
+    }
   }
 
   for (const messageId of input.savedMessageIds) {
@@ -578,9 +768,7 @@ async function readSourceMessages(
       `/channels/${encodeURIComponent(channelId)}/messages/${encodeURIComponent(messageId)}`,
     )
     if (response.status === 404) continue
-    if (response.status === 403) {
-      return { state: 'unavailable', reason: 'forbidden' }
-    }
+    if (response.status === 403) return { state: 'unavailable', reason: 'forbidden' }
     const message = asRecord(await discordJson(response, 'Discord saved message read'))
     if (message) messages.set(messageId, message)
   }
@@ -594,7 +782,90 @@ async function readSourceMessages(
     const rightTimestamp = Date.parse(asString(right.timestamp))
     return leftTimestamp - rightTimestamp
   })
-  return { state: 'available', captures }
+  return { state: 'available', captures, scanCursor }
+}
+
+async function readSavedMessageHealth(
+  env: Env,
+  input: DiscordSavedMessageCheckRequest,
+): Promise<
+  | {
+      state: 'available'
+      captures: Array<Record<string, unknown>>
+      missingMessageIds: string[]
+      checkedMessageIds: string[]
+      rateLimited: boolean
+      retryAfterMs?: number
+    }
+  | { state: 'unavailable'; reason: 'forbidden' }
+> {
+  const channelId = input.threadId ?? input.channelId
+  const starterMessageId = input.starterMessageId ?? input.threadId ?? input.messageIds[0]
+  if (!validSnowflake(starterMessageId))
+    throw new Error('Discord source starter message is missing')
+
+  const context: DiscordCaptureContext = {
+    guildId: input.guildId,
+    channelId,
+    threadId: input.threadId,
+    starterMessageId,
+    forumTags: [],
+  }
+  const captures: Array<Record<string, unknown>> = []
+  const missingMessageIds: string[] = []
+  const checkedMessageIds: string[] = []
+  let index = 0
+  let stopped = false
+  let forbidden = false
+  let rateLimited = false
+  let rateLimitDelay: number | undefined
+
+  const worker = async () => {
+    while (!stopped) {
+      const current = index
+      index += 1
+      if (current >= input.messageIds.length) return
+      const messageId = input.messageIds[current]
+      if (!messageId) return
+      const response = await discordApi(
+        env,
+        `/channels/${encodeURIComponent(channelId)}/messages/${encodeURIComponent(messageId)}`,
+      )
+      if (response.status === 429) {
+        rateLimited = true
+        rateLimitDelay = retryAfterMs(response)
+        stopped = true
+        return
+      }
+      if (response.status === 403) {
+        forbidden = true
+        stopped = true
+        return
+      }
+      if (response.status === 404) {
+        missingMessageIds.push(messageId)
+        checkedMessageIds.push(messageId)
+        continue
+      }
+      const message = asRecord(await discordJson(response, 'Discord saved message health read'))
+      if (!message) throw new Error('Discord saved message response invalid')
+      const capture = buildCaptureFromMessage(message, context)
+      if (!capture) throw new Error('Discord saved message capture invalid')
+      captures.push(capture)
+      checkedMessageIds.push(messageId)
+    }
+  }
+
+  await Promise.all(Array.from({ length: HEALTH_CHECK_CONCURRENCY }, () => worker()))
+  if (forbidden) return { state: 'unavailable', reason: 'forbidden' }
+  return {
+    state: 'available',
+    captures,
+    missingMessageIds,
+    checkedMessageIds,
+    rateLimited,
+    ...(rateLimitDelay !== undefined ? { retryAfterMs: rateLimitDelay } : {}),
+  }
 }
 
 async function handleSourceRead(request: Request, env: Env): Promise<Response> {
@@ -609,9 +880,35 @@ async function handleSourceRead(request: Request, env: Env): Promise<Response> {
   try {
     return json(await readSourceMessages(env, input))
   } catch (error) {
+    if (error instanceof DiscordRateLimitError) {
+      return json(
+        { error: 'discord_rate_limited', retryAfterMs: error.retryAfterMs },
+        { status: 429 },
+      )
+    }
     console.error('Discord source read failed', error)
     return json(
       { error: error instanceof Error ? error.message : 'source_read_failed' },
+      { status: 502 },
+    )
+  }
+}
+
+async function handleSavedMessageCheck(request: Request, env: Env): Promise<Response> {
+  if (!authorizedSetup(request, env)) return json({ error: 'unauthorized' }, { status: 401 })
+  let input: DiscordSavedMessageCheckRequest | undefined
+  try {
+    input = parseSavedMessageCheckRequest(await request.json())
+  } catch {
+    input = undefined
+  }
+  if (!input) return json({ error: 'invalid_message_check_request' }, { status: 400 })
+  try {
+    return json(await readSavedMessageHealth(env, input))
+  } catch (error) {
+    console.error('Discord saved message health check failed', error)
+    return json(
+      { error: error instanceof Error ? error.message : 'message_check_failed' },
       { status: 502 },
     )
   }
@@ -779,6 +1076,10 @@ export default {
 
     if (url.pathname === '/source/read' && request.method === 'POST') {
       return handleSourceRead(request, env)
+    }
+
+    if (url.pathname === '/source/messages/check' && request.method === 'POST') {
+      return handleSavedMessageCheck(request, env)
     }
 
     if (url.pathname === '/interactions' && request.method === 'POST') {
