@@ -86,6 +86,6 @@ use `main` as the production branch, `npm run typecheck` as the build command, a
 you explicitly need preview Workers. Discord credentials remain Cloudflare secrets and must never
 be committed to Git.
 
-The production Worker is `srl-discord-source-bridge` at
-`https://srl-discord-source-bridge.z3013461603.workers.dev` and follows this repository's `main`
-branch through Cloudflare Workers Builds.
+The production target is the `srl-discord-source-bridge` Worker at
+`https://srl-discord-source-bridge.z3013461603.workers.dev`. Grant the Cloudflare GitHub App access
+to this repository before enabling its `main` branch through Cloudflare Workers Builds.
