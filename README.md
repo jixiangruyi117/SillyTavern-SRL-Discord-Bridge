@@ -48,8 +48,10 @@ The D1 binding name is fixed to `DB`.
 
 - `POST /interactions` — Discord Interactions Endpoint
 - `GET /health` — connection check used by SRL
+- `GET /setup/status` — checks the real Discord Message Command registration
 - `POST /setup/register` — registers the `保存到资源库` Message Context Command
 - `POST /source/read` — authenticated, bounded, read-only source check used by SRL
+- `POST /source/messages/check` — checks a bounded batch of explicitly saved message IDs
 - `GET /handoff/:token` — one-time SRL handoff
 - `GET /open/:token` — opens SRL with the handoff token
 
