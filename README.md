@@ -33,6 +33,8 @@ The Worker:
 
 For a thread/forum source, the refresh read is intentionally bounded and only returns messages relevant to SRL's source model: the starter, messages from the starter author, Bot/Webhook messages, and already-saved message IDs. It does not silently archive arbitrary participant comments.
 
+A user-installed Message Command can save the interaction snapshot even when this Bot is not a member of that community. Automatic refresh is different: it uses `DISCORD_BOT_TOKEN`, so the Bot must be in the guild and able to view the source channel. When that access is absent, the Worker reports the source as temporarily uncheckable instead of claiming that the post was deleted. SRL then uses manual refresh for that source: running the same Message Command again updates the existing local source instead of creating a duplicate.
+
 ## Required values
 
 Cloudflare deployment asks for the Discord values belonging to **your own Discord App**:

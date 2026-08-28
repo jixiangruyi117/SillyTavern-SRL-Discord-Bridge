@@ -67,6 +67,19 @@ interface ThreadParentMetadata {
   forumTags: string[]
 }
 
+interface DiscordGuildMetadata {
+  name?: string
+  access: 'available' | 'unavailable' | 'unknown'
+}
+
+type DiscordSourceReadFailure =
+  | { state: 'unavailable'; reason: 'not_found'; stage: 'channel' | 'starter' }
+  | {
+      state: 'uncheckable'
+      reason: 'bot_access' | 'forbidden' | 'read_failed'
+      stage: 'channel' | 'starter' | 'messages' | 'saved_messages'
+    }
+
 const COMMAND_NAME = '保存到资源库'
 const THREAD_CHANNEL_TYPES = new Set([10, 11, 12])
 const DISCORD_SNOWFLAKE_PATTERN = /^\d{5,32}$/u
@@ -476,10 +489,6 @@ async function discordApi(env: Env, path: string): Promise<Response> {
   })
 }
 
-function sourceUnavailable(response: Response): boolean {
-  return response.status === 403 || response.status === 404
-}
-
 function retryAfterMs(response: Response): number | undefined {
   const header =
     response.headers.get('Retry-After') ?? response.headers.get('X-RateLimit-Reset-After')
@@ -498,12 +507,20 @@ async function discordJson(response: Response, operation: string): Promise<unkno
   return response.json()
 }
 
-async function readGuildName(env: Env, guildId: string | undefined): Promise<string | undefined> {
-  if (!validSnowflake(guildId)) return undefined
+async function readGuildMetadata(
+  env: Env,
+  guildId: string | undefined,
+): Promise<DiscordGuildMetadata> {
+  if (!validSnowflake(guildId)) return { access: 'unavailable' }
   const response = await discordApi(env, `/guilds/${encodeURIComponent(guildId)}`)
-  if (!response.ok) return undefined
+  if (response.status === 403 || response.status === 404) return { access: 'unavailable' }
+  if (!response.ok) return { access: 'unknown' }
   const guild = asRecord(await response.json())
-  return asString(guild?.name) || undefined
+  const name = asString(guild?.name)
+  return {
+    access: 'available',
+    ...(name ? { name } : {}),
+  }
 }
 
 async function readThreadParentMetadata(
@@ -610,14 +627,28 @@ async function readSourceMessages(
       captures: Array<Record<string, unknown>>
       scanCursor?: DiscordSourceRemoteScanCursor
     }
-  | { state: 'unavailable'; reason: 'not_found' | 'forbidden' }
+  | DiscordSourceReadFailure
 > {
   const channelId = input.threadId ?? input.channelId
-  const channelResponse = await discordApi(env, `/channels/${encodeURIComponent(channelId)}`)
-  if (sourceUnavailable(channelResponse)) {
+  const [channelResponse, guildMetadata] = await Promise.all([
+    discordApi(env, `/channels/${encodeURIComponent(channelId)}`),
+    readGuildMetadata(env, input.guildId),
+  ])
+  if (channelResponse.status === 403) {
     return {
-      state: 'unavailable',
-      reason: channelResponse.status === 403 ? 'forbidden' : 'not_found',
+      state: 'uncheckable',
+      reason: 'forbidden',
+      stage: 'channel',
+    }
+  }
+  if (channelResponse.status === 404) {
+    if (guildMetadata.access === 'available') {
+      return { state: 'unavailable', reason: 'not_found', stage: 'channel' }
+    }
+    return {
+      state: 'uncheckable',
+      reason: guildMetadata.access === 'unavailable' ? 'bot_access' : 'read_failed',
+      stage: 'channel',
     }
   }
   const channel = asRecord(await discordJson(channelResponse, 'Discord channel read'))
@@ -634,7 +665,6 @@ async function readSourceMessages(
     env,
     `/channels/${encodeURIComponent(channelId)}/messages/${encodeURIComponent(starterMessageId)}`,
   )
-  const guildNamePromise = readGuildName(env, input.guildId)
   const parentMetadataPromise = threadId
     ? readThreadParentMetadata(env, channel)
     : Promise.resolve<ThreadParentMetadata>({
@@ -648,24 +678,26 @@ async function readSourceMessages(
       )
     : Promise.resolve<Response | undefined>(undefined)
 
-  const [starterResponse, guildName, parentMetadata, firstPageResponse] = await Promise.all([
+  const [starterResponse, parentMetadata, firstPageResponse] = await Promise.all([
     starterPromise,
-    guildNamePromise,
     parentMetadataPromise,
     firstPagePromise,
   ])
-  if (sourceUnavailable(starterResponse)) {
+  if (starterResponse.status === 403) {
     return {
-      state: 'unavailable',
-      reason: starterResponse.status === 403 ? 'forbidden' : 'not_found',
+      state: 'uncheckable',
+      reason: 'forbidden',
+      stage: 'starter',
     }
   }
+  if (starterResponse.status === 404)
+    return { state: 'unavailable', reason: 'not_found', stage: 'starter' }
   const starter = asRecord(await discordJson(starterResponse, 'Discord starter message read'))
   if (!starter) throw new Error('Discord starter message response invalid')
 
   const context: DiscordCaptureContext = {
     guildId: input.guildId,
-    guildName,
+    guildName: guildMetadata.name,
     channelId,
     channelName: parentMetadata.channelName,
     threadId,
@@ -680,10 +712,11 @@ async function readSourceMessages(
   let scanCursor = input.scanCursor
 
   if (threadId && firstPageResponse) {
-    if (sourceUnavailable(firstPageResponse)) {
+    if (firstPageResponse.status === 403 || firstPageResponse.status === 404) {
       return {
-        state: 'unavailable',
-        reason: firstPageResponse.status === 403 ? 'forbidden' : 'not_found',
+        state: 'uncheckable',
+        reason: firstPageResponse.status === 403 ? 'forbidden' : 'read_failed',
+        stage: 'messages',
       }
     }
     let records = recordsFromMessageList(
@@ -737,10 +770,11 @@ async function readSourceMessages(
         env,
         `/channels/${encodeURIComponent(channelId)}/messages?${query.toString()}`,
       )
-      if (sourceUnavailable(response)) {
+      if (response.status === 403 || response.status === 404) {
         return {
-          state: 'unavailable',
-          reason: response.status === 403 ? 'forbidden' : 'not_found',
+          state: 'uncheckable',
+          reason: response.status === 403 ? 'forbidden' : 'read_failed',
+          stage: 'messages',
         }
       }
       records = recordsFromMessageList(await discordJson(response, 'Discord thread messages read'))
@@ -768,7 +802,8 @@ async function readSourceMessages(
       `/channels/${encodeURIComponent(channelId)}/messages/${encodeURIComponent(messageId)}`,
     )
     if (response.status === 404) continue
-    if (response.status === 403) return { state: 'unavailable', reason: 'forbidden' }
+    if (response.status === 403)
+      return { state: 'uncheckable', reason: 'forbidden', stage: 'saved_messages' }
     const message = asRecord(await discordJson(response, 'Discord saved message read'))
     if (message) messages.set(messageId, message)
   }
@@ -797,7 +832,7 @@ async function readSavedMessageHealth(
       rateLimited: boolean
       retryAfterMs?: number
     }
-  | { state: 'unavailable'; reason: 'forbidden' }
+  | Extract<DiscordSourceReadFailure, { state: 'uncheckable' }>
 > {
   const channelId = input.threadId ?? input.channelId
   const starterMessageId = input.starterMessageId ?? input.threadId ?? input.messageIds[0]
@@ -857,7 +892,7 @@ async function readSavedMessageHealth(
   }
 
   await Promise.all(Array.from({ length: HEALTH_CHECK_CONCURRENCY }, () => worker()))
-  if (forbidden) return { state: 'unavailable', reason: 'forbidden' }
+  if (forbidden) return { state: 'uncheckable', reason: 'forbidden', stage: 'saved_messages' }
   return {
     state: 'available',
     captures,
