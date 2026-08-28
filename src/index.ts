@@ -31,10 +31,17 @@ interface DiscordSourceReadRequest {
 
 interface DiscordCaptureContext {
   guildId?: string
+  guildName?: string
   channelId: string
+  channelName?: string
   threadId?: string
   starterMessageId: string
   title?: string
+  forumTags: string[]
+}
+
+interface ThreadParentMetadata {
+  channelName?: string
   forumTags: string[]
 }
 
@@ -197,10 +204,12 @@ function buildCapture(interaction: DiscordInteraction): Record<string, unknown> 
   const isStarter = targetId === starterMessageId
   const guildPath = interaction.guild_id ?? '@me'
   const canonicalUrl = `https://discord.com/channels/${encodeURIComponent(guildPath)}/${encodeURIComponent(channelId)}/${encodeURIComponent(targetId)}`
+  const currentChannelName = asString(channel?.name) || undefined
 
   return {
     ...(interaction.guild_id ? { guildId: interaction.guild_id } : {}),
     channelId,
+    ...(!threadId && currentChannelName ? { channelName: currentChannelName } : {}),
     ...(threadId ? { threadId } : {}),
     starterMessageId,
     isStarter,
@@ -214,7 +223,7 @@ function buildCapture(interaction: DiscordInteraction): Record<string, unknown> 
     ...(asString(message.edited_timestamp)
       ? { editedTimestamp: asString(message.edited_timestamp) }
       : {}),
-    ...(threadId && asString(channel?.name) ? { title: asString(channel?.name) } : {}),
+    ...(threadId && currentChannelName ? { title: currentChannelName } : {}),
     forumTags: readForumTags(channel),
     embeds: Array.isArray(message.embeds)
       ? message.embeds.filter((value) => Boolean(asRecord(value)))
@@ -278,30 +287,47 @@ async function consumeHandoff(env: Env, token: string): Promise<Response> {
   }
 }
 
+function discordApplicationCommandsUrl(env: Env): string {
+  return `https://discord.com/api/v10/applications/${encodeURIComponent(env.DISCORD_APPLICATION_ID)}/commands`
+}
+
 async function registerMessageCommand(env: Env): Promise<void> {
   if (!env.DISCORD_APPLICATION_ID || !env.DISCORD_BOT_TOKEN) {
     throw new Error('Discord Application ID / Bot Token 未配置')
   }
-  const response = await fetch(
-    `https://discord.com/api/v10/applications/${encodeURIComponent(env.DISCORD_APPLICATION_ID)}/commands`,
-    {
-      method: 'POST',
-      headers: {
-        Authorization: `Bot ${env.DISCORD_BOT_TOKEN}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        name: COMMAND_NAME,
-        type: 3,
-        integration_types: [1],
-        contexts: [0, 1, 2],
-      }),
+  const response = await fetch(discordApplicationCommandsUrl(env), {
+    method: 'POST',
+    headers: {
+      Authorization: `Bot ${env.DISCORD_BOT_TOKEN}`,
+      'Content-Type': 'application/json',
     },
-  )
+    body: JSON.stringify({
+      name: COMMAND_NAME,
+      type: 3,
+      integration_types: [1],
+      contexts: [0, 1, 2],
+    }),
+  })
   if (!response.ok) {
     const detail = (await response.text()).slice(0, 800)
     throw new Error(`Discord command registration failed: ${response.status} ${detail}`)
   }
+}
+
+async function readMessageCommandStatus(env: Env): Promise<boolean> {
+  if (!env.DISCORD_APPLICATION_ID || !env.DISCORD_BOT_TOKEN) {
+    throw new Error('Discord Application ID / Bot Token 未配置')
+  }
+  const response = await fetch(discordApplicationCommandsUrl(env), {
+    method: 'GET',
+    headers: { Authorization: `Bot ${env.DISCORD_BOT_TOKEN}` },
+  })
+  const payload = await discordJson(response, 'Discord command status read')
+  if (!Array.isArray(payload)) throw new Error('Discord command status response invalid')
+  return payload.some((item) => {
+    const command = asRecord(item)
+    return asString(command?.name) === COMMAND_NAME && asNumber(command?.type) === 3
+  })
 }
 
 function authorizedSetup(request: Request, env: Env): boolean {
@@ -356,21 +382,31 @@ async function discordJson(response: Response, operation: string): Promise<unkno
   return response.json()
 }
 
-async function readThreadForumTags(
+async function readGuildName(env: Env, guildId: string | undefined): Promise<string | undefined> {
+  if (!validSnowflake(guildId)) return undefined
+  const response = await discordApi(env, `/guilds/${encodeURIComponent(guildId)}`)
+  if (!response.ok) return undefined
+  const guild = asRecord(await response.json())
+  return asString(guild?.name) || undefined
+}
+
+async function readThreadParentMetadata(
   env: Env,
   thread: Record<string, unknown>,
-): Promise<string[]> {
+): Promise<ThreadParentMetadata> {
+  const parentId = asString(thread.parent_id)
+  if (!validSnowflake(parentId)) return { forumTags: [] }
+  const response = await discordApi(env, `/channels/${encodeURIComponent(parentId)}`)
+  if (!response.ok) return { forumTags: [] }
+  const parent = asRecord(await response.json())
+  if (!parent) return { forumTags: [] }
   const applied = Array.isArray(thread.applied_tags)
     ? thread.applied_tags.filter((item): item is string => typeof item === 'string')
     : []
-  if (!applied.length) return []
-  const parentId = asString(thread.parent_id)
-  if (!validSnowflake(parentId)) return []
-  const response = await discordApi(env, `/channels/${encodeURIComponent(parentId)}`)
-  if (!response.ok) return []
-  const parent = asRecord(await response.json())
-  if (!parent) return []
-  return readForumTags({ ...parent, applied_tags: applied })
+  return {
+    channelName: asString(parent.name) || undefined,
+    forumTags: readForumTags({ ...parent, applied_tags: applied }),
+  }
 }
 
 function buildCaptureFromMessage(
@@ -390,7 +426,9 @@ function buildCaptureFromMessage(
   const isStarter = messageId === context.starterMessageId
   return {
     ...(context.guildId ? { guildId: context.guildId } : {}),
+    ...(context.guildName ? { guildName: context.guildName } : {}),
     channelId: context.channelId,
+    ...(context.channelName ? { channelName: context.channelName } : {}),
     ...(context.threadId ? { threadId: context.threadId } : {}),
     starterMessageId: context.starterMessageId,
     isStarter,
@@ -411,6 +449,14 @@ function buildCaptureFromMessage(
       : [],
     attachments: normalizeAttachments(message.attachments),
   }
+}
+
+function recordsFromMessageList(payload: unknown): Record<string, unknown>[] {
+  if (!Array.isArray(payload)) throw new Error('Discord thread messages response invalid')
+  return payload.flatMap((item) => {
+    const message = asRecord(item)
+    return message ? [message] : []
+  })
 }
 
 async function readSourceMessages(
@@ -435,22 +481,30 @@ async function readSourceMessages(
     input.threadId ??
     (channelType !== undefined && THREAD_CHANNEL_TYPES.has(channelType) ? channelId : undefined)
   const starterMessageId = threadId ?? input.starterMessageId ?? input.savedMessageIds[0]
-  if (!validSnowflake(starterMessageId)) throw new Error('Discord source starter message is missing')
-  const forumTags = threadId ? await readThreadForumTags(env, channel) : []
-  const context: DiscordCaptureContext = {
-    guildId: input.guildId,
-    channelId,
-    threadId,
-    starterMessageId,
-    title: threadId ? asString(channel.name) || undefined : undefined,
-    forumTags,
-  }
+  if (!validSnowflake(starterMessageId))
+    throw new Error('Discord source starter message is missing')
 
-  const messages = new Map<string, Record<string, unknown>>()
-  const starterResponse = await discordApi(
+  const starterPromise = discordApi(
     env,
     `/channels/${encodeURIComponent(channelId)}/messages/${encodeURIComponent(starterMessageId)}`,
   )
+  const guildNamePromise = readGuildName(env, input.guildId)
+  const parentMetadataPromise = threadId
+    ? readThreadParentMetadata(env, channel)
+    : Promise.resolve<ThreadParentMetadata>({
+        channelName: asString(channel.name) || undefined,
+        forumTags: [],
+      })
+  const firstPagePromise = threadId
+    ? discordApi(env, `/channels/${encodeURIComponent(channelId)}/messages?limit=100`)
+    : Promise.resolve<Response | undefined>(undefined)
+
+  const [starterResponse, guildName, parentMetadata, firstPageResponse] = await Promise.all([
+    starterPromise,
+    guildNamePromise,
+    parentMetadataPromise,
+    firstPagePromise,
+  ])
   if (sourceUnavailable(starterResponse)) {
     return {
       state: 'unavailable',
@@ -459,30 +513,33 @@ async function readSourceMessages(
   }
   const starter = asRecord(await discordJson(starterResponse, 'Discord starter message read'))
   if (!starter) throw new Error('Discord starter message response invalid')
+
+  const context: DiscordCaptureContext = {
+    guildId: input.guildId,
+    guildName,
+    channelId,
+    channelName: parentMetadata.channelName,
+    threadId,
+    starterMessageId,
+    title: threadId ? asString(channel.name) || undefined : undefined,
+    forumTags: parentMetadata.forumTags,
+  }
+
+  const messages = new Map<string, Record<string, unknown>>()
   messages.set(starterMessageId, starter)
   const starterAuthorId = asString(asRecord(starter.author)?.id)
 
-  if (threadId) {
-    let before = ''
-    for (let page = 0; page < MAX_THREAD_PAGES; page += 1) {
-      const query = new URLSearchParams({ limit: '100' })
-      if (before) query.set('before', before)
-      const response = await discordApi(
-        env,
-        `/channels/${encodeURIComponent(channelId)}/messages?${query.toString()}`,
-      )
-      if (sourceUnavailable(response)) {
-        return {
-          state: 'unavailable',
-          reason: response.status === 403 ? 'forbidden' : 'not_found',
-        }
+  if (threadId && firstPageResponse) {
+    if (sourceUnavailable(firstPageResponse)) {
+      return {
+        state: 'unavailable',
+        reason: firstPageResponse.status === 403 ? 'forbidden' : 'not_found',
       }
-      const payload = await discordJson(response, 'Discord thread messages read')
-      if (!Array.isArray(payload)) throw new Error('Discord thread messages response invalid')
-      const records = payload.flatMap((item) => {
-        const message = asRecord(item)
-        return message ? [message] : []
-      })
+    }
+    let records = recordsFromMessageList(
+      await discordJson(firstPageResponse, 'Discord thread messages read'),
+    )
+    for (let page = 0; page < MAX_THREAD_PAGES; page += 1) {
       for (const message of records) {
         const id = asString(message.id)
         if (!validSnowflake(id)) continue
@@ -496,9 +553,21 @@ async function readSourceMessages(
           Boolean(asString(message.webhook_id))
         if (relevant) messages.set(id, message)
       }
-      if (records.length < 100) break
-      before = asString(records.at(-1)?.id)
+      if (records.length < 100 || page + 1 >= MAX_THREAD_PAGES) break
+      const before = asString(records.at(-1)?.id)
       if (!validSnowflake(before)) break
+      const query = new URLSearchParams({ limit: '100', before })
+      const response = await discordApi(
+        env,
+        `/channels/${encodeURIComponent(channelId)}/messages?${query.toString()}`,
+      )
+      if (sourceUnavailable(response)) {
+        return {
+          state: 'unavailable',
+          reason: response.status === 403 ? 'forbidden' : 'not_found',
+        }
+      }
+      records = recordsFromMessageList(await discordJson(response, 'Discord thread messages read'))
     }
   }
 
@@ -630,6 +699,16 @@ async function handleInteraction(
   }
 }
 
+async function readRequestedApplicationId(request: Request): Promise<string | undefined> {
+  try {
+    const body = asRecord(await request.json())
+    const applicationId = asString(body?.applicationId).trim()
+    return applicationId || undefined
+  } catch {
+    return undefined
+  }
+}
+
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url)
@@ -653,11 +732,43 @@ export default {
       }
     }
 
-    if (url.pathname === '/setup/register' && request.method === 'POST') {
+    if (url.pathname === '/setup/status' && request.method === 'GET') {
       if (!authorizedSetup(request, env)) return json({ error: 'unauthorized' }, { status: 401 })
       try {
+        return json({
+          ok: true,
+          applicationId: env.DISCORD_APPLICATION_ID,
+          commandName: COMMAND_NAME,
+          commandRegistered: await readMessageCommandStatus(env),
+        })
+      } catch (error) {
+        return json(
+          { error: error instanceof Error ? error.message : 'command_status_failed' },
+          { status: 502 },
+        )
+      }
+    }
+
+    if (url.pathname === '/setup/register' && request.method === 'POST') {
+      if (!authorizedSetup(request, env)) return json({ error: 'unauthorized' }, { status: 401 })
+      const requestedApplicationId = await readRequestedApplicationId(request)
+      if (requestedApplicationId && requestedApplicationId !== env.DISCORD_APPLICATION_ID) {
+        return json(
+          {
+            error: 'application_id_mismatch',
+            applicationId: env.DISCORD_APPLICATION_ID,
+          },
+          { status: 409 },
+        )
+      }
+      try {
         await registerMessageCommand(env)
-        return json({ ok: true, commandName: COMMAND_NAME })
+        return json({
+          ok: true,
+          applicationId: env.DISCORD_APPLICATION_ID,
+          commandName: COMMAND_NAME,
+          commandRegistered: true,
+        })
       } catch (error) {
         return json(
           { error: error instanceof Error ? error.message : 'command_registration_failed' },
